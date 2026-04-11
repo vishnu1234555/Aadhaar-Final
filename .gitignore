@@ -1,0 +1,23 @@
+# Model files (Too large for Git)
+model/
+GLINER_PROD_V1.zip
+Fine_tuned/
+*.safetensors
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.env
+
+# Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# OS
+.DS_Store
+Thumbs.db

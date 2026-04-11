@@ -1,0 +1,21 @@
+# Ignore Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Ignore Node
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# OS
+.DS_Store
+
+# Ignore git files
+.git/
+.gitignore
+
+# Note: We purposely DO NOT ignore `model/` because backend needs it!
