@@ -1,8 +1,9 @@
-# Ignore Python cache
+# Ignore Python cache & environments
 __pycache__/
 *.py[cod]
 *$py.class
 venv/
+.venv/
 .env
 
 # Ignore Node
@@ -11,11 +12,15 @@ dist/
 dist-ssr/
 *.local
 
-# OS
+# Ignore OS files & Git
 .DS_Store
-
-# Ignore git files
 .git/
 .gitignore
+
+# NUKE THE BLOAT
+*.zip
+**/*.zip
+GLiNER_PROD_V1.zip
+GLINER_PROD_V1.zip
 
 # Note: We purposely DO NOT ignore `model/` because backend needs it!

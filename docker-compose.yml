@@ -1,22 +1,25 @@
-version: '3.8'
-
 services:
   backend:
+    image: vishnukarthik130474/aadhaar-backend:latest
     build:
-      context: .
-      dockerfile: backend/Dockerfile
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aadhaar-backend
     ports:
       - "5000:5000"
-    environment:
-      - FLASK_ENV=production
+    volumes:
+      - ./model:/app/model:ro
     restart: unless-stopped
 
   frontend:
     build:
-      context: .
-      dockerfile: frontend/Dockerfile
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: http://localhost:5000
+    container_name: aadhaar-frontend
     ports:
-      - "8080:80"
+      - "5173:80"
     depends_on:
       - backend
     restart: unless-stopped

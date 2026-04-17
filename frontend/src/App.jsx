@@ -25,16 +25,18 @@ function App() {
       if (response.data.success) {
         setResults({
           entities: response.data.entities,
-          time: response.data.inference_time_ms
+          time: response.data.inference_time_ms,
+          aadhaarNumber: response.data.aadhaar_number || null
         })
       } else {
-        setError(response.data.error || 'Failed to extract entities.')
+        setError(response.data.error || response.data.detail || 'Failed to extract entities.')
       }
     } catch (err) {
       console.error(err)
       setError(
-        err.response?.data?.error || 
-        'Is the backend running? Ensure you started the Flask server on port 5000.'
+        err.response?.data?.error ||
+        err.response?.data?.detail ||
+        'Is the backend running? Ensure you started the FastAPI server on port 5000.'
       )
     } finally {
       setLoading(false)
@@ -118,6 +120,15 @@ function App() {
 
         {results && results.entities && results.entities.length > 0 && (
           <div className="entities-list">
+            {results.aadhaarNumber && (
+              <div className="entity-item" style={{ borderColor: 'rgba(16, 185, 129, 0.35)' }}>
+                <div className="entity-header">
+                  <span className="entity-label">Aadhaar Number (Raw)</span>
+                  <span className="entity-score">Primary</span>
+                </div>
+                <div className="entity-value">{results.aadhaarNumber}</div>
+              </div>
+            )}
             {results.entities.map((entity, index) => (
               <div key={index} className="entity-item">
                 <div className="entity-header">

@@ -1,5 +1,9 @@
-flask==3.0.3
-flask-cors==4.0.1
-torch==2.5.1
-gliner==0.2.14
-gliner2==0.0.1
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.1+cpu
+torchvision
+torchaudio
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+onnxruntime==1.17.1
+numpy<2.0.0
+gliner==0.2.13
