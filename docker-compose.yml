@@ -8,7 +8,18 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      # Weights are mounted, not baked into the image. Without this directory
+      # the service starts but reports degraded and /api/extract returns 503.
       - ./model:/app/model:ro
+    environment:
+      MODEL_DIR: /app/model
+      ALLOWED_ORIGINS: http://localhost:5173
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,json,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://localhost:5000/health'))['model_loaded'] else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     restart: unless-stopped
 
   frontend:

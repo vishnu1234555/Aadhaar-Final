@@ -25,6 +25,8 @@ function App() {
       if (response.data.success) {
         setResults({
           entities: response.data.entities,
+          rejected: response.data.rejected || [],
+          counts: response.data.counts || null,
           time: response.data.inference_time_ms,
           aadhaarNumber: response.data.aadhaar_number || null
         })
@@ -133,12 +135,37 @@ function App() {
               <div key={index} className="entity-item">
                 <div className="entity-header">
                   <span className="entity-label">{entity.label}</span>
-                  <span className="entity-score">{entity.confidence}%</span>
+                  <span className="entity-score">
+                    {entity.confidence == null ? 'structural' : `${entity.confidence}%`}
+                  </span>
                 </div>
                 <div className="entity-value">{entity.text}</div>
+                <div className="entity-source">
+                  {entity.source === 'regex' ? 'pattern sweep' : 'model'} &middot; passed validation
+                </div>
               </div>
             ))}
           </div>
+        )}
+
+        {results && results.counts && (
+          <p className="pipeline-summary">
+            {results.counts.candidates} candidates &rarr; {results.counts.kept} kept,{' '}
+            {results.counts.rejected} rejected
+          </p>
+        )}
+
+        {results && results.rejected && results.rejected.length > 0 && (
+          <details className="rejected-block">
+            <summary>Why {results.rejected.length} candidate(s) were dropped</summary>
+            {results.rejected.map((r, i) => (
+              <div key={i} className="rejected-item">
+                <span className="entity-label">{r.label}</span>
+                <span className="entity-value">{r.text}</span>
+                <span className="rejected-reason">{r.reason}</span>
+              </div>
+            ))}
+          </details>
         )}
       </section>
     </div>

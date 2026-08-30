@@ -1,81 +1,95 @@
+"""
+backend/app.py
+==============
+FastAPI service wrapping a fine-tuned GLiNER2 extractor for Indian financial PII.
+
+Request flow:
+  1. EXTRACT   — GLiNER2 proposes labelled spans.
+  2. RECALL    — regex sweeps the text for well-formed identifiers the model missed.
+  3. VALIDATE  — each candidate is checked against the structure its label requires.
+  4. ARBITRATE — overlapping survivors are resolved by structural specificity.
+
+Steps 3 and 4 live in `validation.py` and are covered by `test_validation.py`,
+which runs without the model.
+"""
+
 from contextlib import asynccontextmanager
 from typing import Any, List, Optional
+import os
+import re
+import time
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import torch
-import time
-import os
-import sys
-import re
 
-# Attempt to import GLiNER
+from validation import REGEX_PATTERNS, validate_and_arbitrate
+
+# GLiNER2 is a hard requirement. The previous version fell back to GLiNER v1 on
+# ImportError, which is a different package with a different API: v1 exposes
+# predict_entities, not extract_entities, so the fallback turned a missing
+# dependency into an AttributeError on every request instead of a startup error.
 try:
     from gliner2 import GLiNER2
-except ImportError:
-    # Fallback to standard gliner if gliner2 isn't available
-    from gliner import GLiNER as GLiNER2
+except ImportError as exc:  # pragma: no cover - environment problem, not logic
+    raise ImportError(
+        "gliner2 is required but not installed. The fine-tuned weights are a "
+        "GLiNER2 'extractor' model and cannot be loaded by the gliner (v1) "
+        "package. Install it with: pip install gliner2"
+    ) from exc
 
-# ==========================================
-# 1. INITIALIZE MODEL & REGEX PATTERNS
-# ==========================================
-MODEL_DIR = "/app/model"
-if not os.path.exists(os.path.join(MODEL_DIR, "config.json")):
-    print(
-        f"WARNING: Model config missing at {MODEL_DIR}/config.json. "
-        "Startup will continue, but inference endpoints will return errors until model is available."
-    )
+MODEL_DIR = os.getenv("MODEL_DIR", "/app/model")
 
-print(f"--- Initializing Inference Engine from {MODEL_DIR} ---")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Browsers reject credentialed requests against a wildcard origin, so pairing
+# allow_origins=["*"] with allow_credentials=True never worked as intended.
+# Default to the dev frontend and let deployments name their own origins.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000"
+    ).split(",")
+    if o.strip()
+]
 
-eval_model = None
-
-# Default labels mapping
 DEFAULT_LABELS = [
-    "Aadhaar Number", 
-    "VPA", 
-    "IFSC Code", 
-    "Bank Name", 
-    "Transaction ID", 
+    "Aadhaar Number",
+    "VPA",
+    "IFSC Code",
+    "Bank Name",
+    "Transaction ID",
     "Driving Licence",
     "PAN Number",
     "Account Number",
-    "Beneficiary Name"
+    "Beneficiary Name",
 ]
 
-# Strict Regex Patterns for Indian KYC and Banking Data
-REGEX_PATTERNS = {
-    "Aadhaar Number": r"\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b",
-    "PAN Number": r"\b[A-Z]{5}\d{4}[A-Z]\b",
-    "IFSC Code": r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
-    "VPA": r"\b[\w.\-_]+@[a-zA-Z]+\b",
-    "Driving Licence": r"\b[A-Z]{2}\d{2}[-\s]?\d{4}[-\s]?\d{7}\b",
-    "Account Number": r"\b\d{9,18}\b"
-}
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+eval_model: Optional[Any] = None
+
 
 class ExtractRequest(BaseModel):
-    text: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=50_000)
     labels: Optional[List[str]] = None
-    threshold: float = Field(default=0.5, ge=0.0)
+    threshold: float = Field(default=0.5, ge=0.0, le=1.0)
 
 
 def _load_model() -> None:
     global eval_model
-    try:
-        eval_model = GLiNER2.from_pretrained(
-            MODEL_DIR, 
-            local_files_only=True, 
-            proxies=None,          
-            resume_download=True   
-        ).to(device)
-        print("SUCCESS: Model loaded.")
-    except Exception as e:
+    if not os.path.exists(os.path.join(MODEL_DIR, "config.json")):
         print(
-            "SEVERE: Failed to load GLiNER2 model during startup. "
-            f"MODEL_DIR={MODEL_DIR}. Error: {e}"
+            f"SEVERE: no config.json under MODEL_DIR={MODEL_DIR}. The weights are "
+            "not baked into the image; they are mounted at runtime. Fetch them "
+            "with: huggingface-cli download VK1402/AADHAAR_Extractor "
+            "--local-dir ./model"
         )
+        eval_model = None
+        return
+    try:
+        eval_model = GLiNER2.from_pretrained(MODEL_DIR, local_files_only=True).to(device)
+        print(f"SUCCESS: model loaded from {MODEL_DIR} on {device}.")
+    except Exception as exc:
+        print(f"SEVERE: failed to load model from {MODEL_DIR}: {exc}")
         eval_model = None
 
 
@@ -85,133 +99,178 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Indian Financial PII Extractor",
+    description="Fine-tuned NER with a structural validation layer.",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+def _locate(haystack: str, needle: str, claimed: set[tuple[int, int]]) -> tuple[int, int]:
+    """Find the first occurrence of `needle` not already claimed by another span."""
+    if not needle:
+        return -1, -1
+    start = haystack.find(needle)
+    while start != -1:
+        span = (start, start + len(needle))
+        if span not in claimed:
+            claimed.add(span)
+            return span
+        start = haystack.find(needle, start + 1)
+    return -1, -1
+
+
+def _normalise_score(raw: Any) -> float:
+    """Model scores arrive as 0-1 probabilities or 0-100 percentages."""
+    try:
+        score = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    # The old guard was isinstance(score, float), which silently skipped ints,
+    # so an integer score of 1 was reported as 1% instead of 100%.
+    return round(score * 100, 2) if score <= 1.0 else round(score, 2)
+
+
+def _model_candidates(raw: Any, text: str, claimed: set) -> list[dict]:
+    out: list[dict] = []
+
+    def add(label: str, value: str, score: Any) -> None:
+        value = str(value).strip()
+        if not value:
+            return
+        start, end = _locate(text, value, claimed)
+        out.append({
+            "label": label,
+            "text": value,
+            "start": start,
+            "end": end if end >= 0 else -1,
+            "confidence": _normalise_score(score),
+            "source": "model",
+        })
+
+    if isinstance(raw, dict):
+        entities = raw.get("entities", raw)
+        if isinstance(entities, dict):
+            for label, matches in entities.items():
+                for match in matches or []:
+                    if isinstance(match, str):
+                        add(label, match, 1.0)
+                    elif isinstance(match, dict):
+                        add(
+                            label,
+                            match.get("text", ""),
+                            match.get("confidence", match.get("score", 0.0)),
+                        )
+    elif isinstance(raw, list):
+        for ent in raw:
+            if isinstance(ent, dict):
+                add(ent.get("label", "Unknown"), ent.get("text", ""), ent.get("score", 1.0))
+    return out
+
+
+def _regex_candidates(text: str, labels: list[str], claimed: set) -> list[dict]:
+    """Sweep for well-formed identifiers the model may have missed.
+
+    These are recall, not truth: every one still goes through validation and
+    arbitration alongside the model's own candidates.
+    """
+    out: list[dict] = []
+    for label in labels:
+        pattern = REGEX_PATTERNS.get(label)
+        if not pattern:
+            continue
+        flags = re.IGNORECASE if label == "VPA" else 0
+        for match in re.finditer(pattern, text, flags=flags):
+            span = match.span()
+            if span in claimed:
+                continue
+            claimed.add(span)
+            out.append({
+                "label": label,
+                "text": match.group(),
+                "start": span[0],
+                "end": span[1],
+                # A pattern match is not a probability. Reporting it as 100%
+                # confidence overstated it; provenance is carried by `source`.
+                "confidence": None,
+                "source": "regex",
+            })
+    return out
 
 
 @app.post("/api/extract")
 def extract_entities(payload: ExtractRequest) -> dict[str, Any]:
     if eval_model is None:
-        raise HTTPException(status_code=500, detail="Model failed to initialize on server startup.")
+        raise HTTPException(
+            status_code=503,
+            detail="Model is not loaded. See server logs; weights mount at MODEL_DIR.",
+        )
 
     text = payload.text
     labels = payload.labels or DEFAULT_LABELS
-    threshold = payload.threshold
 
-    print(f"\nAnalyzing text (length {len(text)})...")
-    start_time = time.time()
+    print(f"Analyzing text (length {len(text)})...")
+    start = time.perf_counter()
 
     try:
-        # 1. GLiNER Inference Extraction
-        raw_result = eval_model.extract_entities(text, labels, threshold=threshold)
-        inference_time = time.time() - start_time
-        print(f"Inference time: {inference_time:.3f} seconds")
+        raw = eval_model.extract_entities(text, labels, threshold=payload.threshold)
+    except Exception as exc:
+        # Never echo the exception to the client: this endpoint handles PII and
+        # the message can embed fragments of the submitted text.
+        print(f"ERROR during inference: {type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=500, detail="Inference failed.") from exc
 
-        formatted_entities: list[dict[str, Any]] = []
+    inference_ms = (time.perf_counter() - start) * 1000
 
-        if isinstance(raw_result, dict):
-            entities_dict = raw_result.get("entities", raw_result)
+    claimed: set[tuple[int, int]] = set()
+    candidates = _model_candidates(raw, text, claimed)
+    candidates += _regex_candidates(text, labels, claimed)
 
-            if isinstance(entities_dict, dict):
-                for label, matches in entities_dict.items():
-                    for match in matches:
-                        if isinstance(match, str):
-                            formatted_entities.append(
-                                {"label": label, "text": match, "confidence": 100.0, "source": "model"}
-                            )
-                        elif isinstance(match, dict):
-                            text_val = match.get("text", str(match))
-                            score = match.get("confidence", match.get("score", 0.0))
-                            if isinstance(score, float) and score <= 1.0:
-                                score *= 100
+    kept, rejected = validate_and_arbitrate(candidates)
+    total_ms = (time.perf_counter() - start) * 1000
 
-                            formatted_entities.append(
-                                {
-                                    "label": label,
-                                    "text": text_val,
-                                    "confidence": round(float(score), 2),
-                                    "source": "model"
-                                }
-                            )
-        elif isinstance(raw_result, list):
-            for ent in raw_result:
-                if isinstance(ent, dict):
-                    formatted_entities.append(
-                        {
-                            "label": ent.get("label", "Unknown"),
-                            "text": ent.get("text", ""),
-                            "confidence": round(float(ent.get("score", 1.0)) * 100, 2),
-                            "source": "model"
-                        }
-                    )
+    aadhaar = [
+        re.sub(r"\D", "", e["text"])
+        for e in kept
+        if e["label"].strip().lower() == "aadhaar number"
+    ]
+    aadhaar = list(dict.fromkeys(aadhaar))
 
-        # 2. Regex Hard-Match Extraction
-        for target_label in labels:
-            pattern = REGEX_PATTERNS.get(target_label)
-            if pattern:
-                # Use IGNORECASE for VPA to catch varying casing in email formats
-                flags = re.IGNORECASE if target_label == "VPA" else 0
-                for match in re.finditer(pattern, text, flags=flags):
-                    matched_text = match.group()
-                    
-                    # Deduplication check against model outputs
-                    already_exists = any(
-                        e["label"].lower() == target_label.lower() and e["text"] == matched_text 
-                        for e in formatted_entities
-                    )
-                    
-                    if not already_exists:
-                        formatted_entities.append({
-                            "label": target_label,
-                            "text": matched_text,
-                            "confidence": 100.0,
-                            "source": "regex"
-                        })
+    print(
+        f"  {len(candidates)} candidates -> {len(kept)} kept, "
+        f"{len(rejected)} rejected ({inference_ms:.0f}ms inference)"
+    )
 
-        # 3. Aadhaar Specific Parsing
-        aadhaar_candidates: list[str] = []
-        for entity in formatted_entities:
-            label = str(entity.get("label", "")).strip().lower()
-            if label != "aadhaar number":
-                continue
-
-            entity_text = str(entity.get("text", "")).strip()
-            digits_only = re.sub(r"\D", "", entity_text)
-            
-            if len(digits_only) == 12:
-                aadhaar_candidates.append(digits_only)
-            elif entity_text:
-                aadhaar_candidates.append(entity_text)
-
-        # Keep order and remove duplicates.
-        unique_aadhaar_numbers = list(dict.fromkeys(aadhaar_candidates))
-
-        return {
-            "success": True,
-            "inference_time_ms": round(inference_time * 1000, 2),
-            "entities": formatted_entities,
-            "aadhaar_number": unique_aadhaar_numbers[0] if unique_aadhaar_numbers else None,
-            "aadhaar_numbers": unique_aadhaar_numbers,
-        }
-    except Exception as e:
-        import traceback
-
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    return {
+        "success": True,
+        "inference_time_ms": round(inference_ms, 2),
+        "total_time_ms": round(total_ms, 2),
+        "entities": kept,
+        "rejected": rejected,
+        "counts": {
+            "candidates": len(candidates),
+            "kept": len(kept),
+            "rejected": len(rejected),
+        },
+        "aadhaar_number": aadhaar[0] if aadhaar else None,
+        "aadhaar_numbers": aadhaar,
+    }
 
 
 @app.get("/health")
 def health_check() -> dict[str, Any]:
     return {
-        "status": "healthy",
+        "status": "healthy" if eval_model is not None else "degraded",
         "model_loaded": eval_model is not None,
+        "model_dir": MODEL_DIR,
         "device": str(device),
     }
 

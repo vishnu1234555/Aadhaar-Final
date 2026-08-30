@@ -1,9 +1,15 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# CPU-only torch. This is a text model: the CUDA wheels, torchvision and
+# torchaudio added roughly 2GB to the image and nothing here imports them.
 torch==2.5.1+cpu
-torchvision
-torchaudio
+
+# The [local] extra is required, not optional. A bare `gliner2` install ships
+# only the HTTP client — no torch, no transformers — and from_pretrained cannot
+# load local weights. Previously this file pinned `gliner==0.2.13`, a different
+# package whose API exposes predict_entities rather than extract_entities.
+gliner2[local]==2.0.0
+
 fastapi==0.115.12
 uvicorn[standard]==0.34.2
-onnxruntime==1.17.1
-numpy<2.0.0
-gliner==0.2.13
+pydantic>=2,<3
